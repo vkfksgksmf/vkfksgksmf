@@ -109,7 +109,14 @@
     <label>API 키 (sk-로 시작)</label>
     <input type="password" id="apiKey" placeholder="sk-...">
     <label>모델</label>
-    <input type="text" id="model" value="gpt-image-1">
+    <select id="model">
+      <option value="auto">자동 (쓸 수 있는 모델을 알아서 찾기)</option>
+      <option value="gpt-image-2">gpt-image-2 (최신)</option>
+      <option value="gpt-image-1.5">gpt-image-1.5</option>
+      <option value="chatgpt-image-latest">chatgpt-image-latest</option>
+      <option value="gpt-image-1">gpt-image-1</option>
+      <option value="gpt-image-1-mini">gpt-image-1-mini (저렴)</option>
+    </select>
     <label class="row" style="font-size:14px;margin-bottom:12px"><input type="checkbox" id="remember" checked> 이 브라우저에 키 기억하기</label>
     <p class="hint" style="margin-top:0">키는 이 브라우저 안에만 저장되고, OpenAI 외에 어디에도 보내지지 않아요. 공용 컴퓨터에서는 '기억하기'를 끄세요.</p>
     <div class="row" style="justify-content:flex-end;margin-top:12px">
@@ -150,15 +157,19 @@
   // ---------- 설정 ----------
   const settings = {
     key: localStorage.getItem('oai_key') || '',
-    model: localStorage.getItem('oai_model') || 'gpt-image-1'
+    model: localStorage.getItem('oai_model2') || 'auto'
   };
+  const MODEL_ORDER = ['gpt-image-2','gpt-image-1.5','chatgpt-image-latest','gpt-image-1','gpt-image-1-mini'];
+  const NO_ACCESS = /does not exist|not found|do not have access|must be verified|not supported|invalid model|unknown model/i;
   $('#btnSettings').onclick = () => { $('#apiKey').value = settings.key; $('#model').value = settings.model; $('#modal').style.display='flex'; };
   $('#btnCloseModal').onclick = () => $('#modal').style.display='none';
   $('#btnSaveKey').onclick = () => {
     settings.key = $('#apiKey').value.trim();
-    settings.model = $('#model').value.trim() || 'gpt-image-1';
-    if ($('#remember').checked){ localStorage.setItem('oai_key', settings.key); localStorage.setItem('oai_model', settings.model); }
-    else { localStorage.removeItem('oai_key'); localStorage.setItem('oai_model', settings.model); }
+    settings.model = $('#model').value || 'auto';
+    localStorage.removeItem('oai_working_model');
+    if ($('#remember').checked){ localStorage.setItem('oai_key', settings.key); }
+    else { localStorage.removeItem('oai_key'); }
+    localStorage.setItem('oai_model2', settings.model);
     $('#modal').style.display='none'; toast('저장했어요');
   };
 
@@ -288,20 +299,38 @@
       mctx.globalCompositeOperation = 'destination-out'; mctx.drawImage(sel,0,0);
       const maskBlob = await toBlob(m);
 
-      const fd = new FormData();
-      fd.append('model', settings.model);
-      fd.append('image', imageBlob, 'image.png');
-      fd.append('mask', maskBlob, 'mask.png');
-      fd.append('prompt', 'Edit only the masked (transparent) area of the image. Keep everything else unchanged. Request: ' + userPrompt);
-      fd.append('size', 'auto');
-      fd.append('quality', $('#quality').value);
-      fd.append('n', '1');
+      async function callModel(model){
+        const fd = new FormData();
+        fd.append('model', model);
+        fd.append('image', imageBlob, 'image.png');
+        fd.append('mask', maskBlob, 'mask.png');
+        fd.append('prompt', 'Edit only the masked (transparent) area of the image. Keep everything else unchanged. Request: ' + userPrompt);
+        fd.append('size', 'auto');
+        fd.append('quality', $('#quality').value);
+        fd.append('n', '1');
+        const res = await fetch('https://api.openai.com/v1/images/edits', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + settings.key }, body: fd
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(json?.error?.message || ('요청 실패 (' + res.status + ')'));
+        return json;
+      }
 
-      const res = await fetch('https://api.openai.com/v1/images/edits', {
-        method: 'POST', headers: { Authorization: 'Bearer ' + settings.key }, body: fd
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json?.error?.message || ('요청 실패 (' + res.status + ')'));
+      let models;
+      if (settings.model === 'auto'){
+        const known = localStorage.getItem('oai_working_model');
+        models = known ? [known, ...MODEL_ORDER.filter(m => m !== known)] : MODEL_ORDER;
+      } else models = [settings.model];
+
+      let json = null, lastErr = null, tried = [];
+      for (const m of models){
+        try { json = await callModel(m); localStorage.setItem('oai_working_model', m); break; }
+        catch (e) {
+          lastErr = e; tried.push(m);
+          if (!NO_ACCESS.test(e.message)) throw e;   // 모델 문제가 아니면 바로 중단
+        }
+      }
+      if (!json) throw new Error('사용 가능한 이미지 모델이 없어요 (시도: ' + tried.join(', ') + ')\n마지막 오류: ' + lastErr.message);
       const b64 = json?.data?.[0]?.b64_json;
       if (!b64) throw new Error('결과 이미지를 받지 못했어요');
       const out = await loadImg('data:image/png;base64,' + b64);
